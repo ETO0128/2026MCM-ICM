@@ -5,7 +5,7 @@ import seaborn as sns
 from pathlib import Path
 import warnings
 from datetime import datetime, timedelta
-import json
+import calendar
 
 warnings.filterwarnings('ignore')
 
@@ -17,6 +17,8 @@ plt.rcParams['axes.unicode_minus'] = False
 # 常量配置
 AVG_PERSON_WEIGHT = 70  # 假设平均每人70kg
 TIME_SLOT_MINUTES = 5  # 时间分析粒度（分钟）
+TRAINING_DAYS = 20  # 只分析前20天数据作为训练集
+VALIDATION_DAYS = 10  # 后10天作为验证集
 
 
 # =========================================
@@ -43,6 +45,7 @@ def get_data_path():
 def load_and_clean(file_path, cols=None, parse_dates=['Time']):
     """
     读取CSV文件，自动处理中文编码
+    返回过滤后的DataFrame（只包含前TRAINING_DAYS天数据）
     """
     print(f"正在读取: {file_path.name}")
 
@@ -66,6 +69,16 @@ def load_and_clean(file_path, cols=None, parse_dates=['Time']):
                 df = df.dropna(subset=['Time'])
                 df = df.sort_values('Time').reset_index(drop=True)
 
+                # 只保留前TRAINING_DAYS天的数据（训练集）
+                if not df.empty:
+                    start_date = df['Time'].min().date()
+                    training_end_date = start_date + timedelta(days=TRAINING_DAYS - 1)
+
+                    # 过滤数据
+                    df = df[df['Time'].dt.date <= training_end_date]
+                    print(f"  -> 保留前{TRAINING_DAYS}天数据: {start_date} 到 {training_end_date}")
+                    print(f"  -> 训练集记录数: {len(df):,}")
+
             # 标准化数据类型
             if 'Floor' in df.columns:
                 # 尝试将Floor转换为数值类型
@@ -83,6 +96,120 @@ def load_and_clean(file_path, cols=None, parse_dates=['Time']):
 
     print(f"❌ 无法读取 {file_path.name}")
     return None
+
+
+def analyze_date_distribution(data_frames):
+    """
+    分析日期分布，检查工作日和周末/节假日的分布
+    """
+    print("\n[日期分布分析]")
+
+    # 使用hall_calls数据（通常最全）
+    if 'hall_calls' in data_frames and not data_frames['hall_calls'].empty:
+        df = data_frames['hall_calls'].copy()
+    elif 'time_slot_stats' in data_frames and not data_frames['time_slot_stats'].empty:
+        df = data_frames['time_slot_stats'].reset_index().copy()
+        df.rename(columns={'Time_Slot': 'Time'}, inplace=True)
+    else:
+        print("⚠️  无足够数据用于日期分布分析")
+        return {}
+
+    # 添加日期特征
+    df['Date'] = df['Time'].dt.date
+    df['Year'] = df['Time'].dt.year
+    df['Month'] = df['Time'].dt.month
+    df['Day'] = df['Time'].dt.day
+    df['Weekday'] = df['Time'].dt.weekday  # 0=周一, 6=周日
+    df['Weekday_Name'] = df['Time'].dt.day_name()
+    df['Is_Weekend'] = df['Weekday'] >= 5
+
+    # 统计每日呼叫量
+    daily_stats = df.groupby('Date').agg({
+        'Floor': 'count',  # 呼叫次数
+    }).rename(columns={'Floor': 'Daily_Calls'})
+
+    # 添加星期几和是否周末信息
+    daily_stats['Weekday'] = daily_stats.index.map(lambda x: x.weekday())
+    daily_stats['Weekday_Name'] = daily_stats.index.map(lambda x: x.strftime('%A'))
+    daily_stats['Is_Weekend'] = daily_stats['Weekday'] >= 5
+
+    # 按星期几分组统计 - 修复：避免多层索引
+    weekday_summary = daily_stats.groupby('Weekday').agg({
+        'Daily_Calls': ['mean', 'std', 'count', 'min', 'max'],
+        'Weekday_Name': 'first'
+    })
+
+    # 扁平化列名
+    weekday_summary.columns = [
+        f"{col[0]}_{col[1]}" if col[1] != '' else col[0]
+        for col in weekday_summary.columns
+    ]
+
+    # 重命名列使其更易读
+    weekday_summary = weekday_summary.rename(columns={
+        'Daily_Calls_mean': 'Mean_Calls',
+        'Daily_Calls_std': 'Std_Calls',
+        'Daily_Calls_count': 'Count',
+        'Daily_Calls_min': 'Min_Calls',
+        'Daily_Calls_max': 'Max_Calls',
+        'Weekday_Name_first': 'Weekday_Name'
+    })
+
+    # 周末 vs 工作日统计
+    weekend_vs_weekday = daily_stats.groupby('Is_Weekend').agg({
+        'Daily_Calls': ['mean', 'std', 'count', 'min', 'max']
+    })
+
+    # 扁平化列名
+    weekend_vs_weekday.columns = [
+        f"{col[0]}_{col[1]}" if col[1] != '' else col[0]
+        for col in weekend_vs_weekday.columns
+    ]
+
+    # 重命名列
+    weekend_vs_weekday = weekend_vs_weekday.rename(columns={
+        'Daily_Calls_mean': 'Mean_Calls',
+        'Daily_Calls_std': 'Std_Calls',
+        'Daily_Calls_count': 'Count',
+        'Daily_Calls_min': 'Min_Calls',
+        'Daily_Calls_max': 'Max_Calls'
+    })
+
+    # 计算变异系数（标准差/均值），衡量波动性
+    weekday_summary['CV'] = weekday_summary['Std_Calls'] / weekday_summary['Mean_Calls']
+
+    # 打印统计结果
+    print(f"总分析天数: {len(daily_stats)}天")
+    print(f"工作日天数: {len(daily_stats[~daily_stats['Is_Weekend']])}天")
+    print(f"周末天数: {len(daily_stats[daily_stats['Is_Weekend']])}天")
+
+    print("\n按星期统计:")
+    for weekday in range(7):
+        if weekday in weekday_summary.index:
+            weekday_name = weekday_summary.loc[weekday, 'Weekday_Name']
+            mean_calls = weekday_summary.loc[weekday, 'Mean_Calls']
+            std_calls = weekday_summary.loc[weekday, 'Std_Calls']
+            count = weekday_summary.loc[weekday, 'Count']
+
+            if pd.notna(mean_calls):
+                print(f"  {weekday_name}: {mean_calls:.0f} ± {std_calls:.0f} 次/天 (N={count:.0f})")
+
+    print("\n周末 vs 工作日对比:")
+    for is_weekend in [False, True]:
+        label = "周末" if is_weekend else "工作日"
+        if is_weekend in weekend_vs_weekday.index:
+            mean_calls = weekend_vs_weekday.loc[is_weekend, 'Mean_Calls']
+            std_calls = weekend_vs_weekday.loc[is_weekend, 'Std_Calls']
+            count = weekend_vs_weekday.loc[is_weekend, 'Count']
+
+            if pd.notna(mean_calls):
+                print(f"  {label}: {mean_calls:.0f} ± {std_calls:.0f} 次/天 (N={count:.0f})")
+
+    return {
+        'daily_stats': daily_stats,
+        'weekday_summary': weekday_summary,
+        'weekend_vs_weekday': weekend_vs_weekday
+    }
 
 
 def estimate_passenger_count(load_changes_df):
@@ -112,6 +239,11 @@ def estimate_passenger_count(load_changes_df):
     df['Hour'] = df['Time'].dt.hour
     df['Minute'] = df['Time'].dt.minute
     df['Time_Slot'] = df['Time'].dt.floor(f'{TIME_SLOT_MINUTES}min')
+
+    # 添加日期特征
+    df['Date'] = df['Time'].dt.date
+    df['Weekday'] = df['Time'].dt.weekday
+    df['Is_Weekend'] = df['Weekday'] >= 5
 
     return df
 
@@ -203,9 +335,17 @@ def analyze_traffic_patterns(hall_calls, time_slot_minutes=5):
     # 创建时间槽
     df['Time_Slot'] = df['Time'].dt.floor(f'{time_slot_minutes}min')
 
+    # 添加日期特征
+    df['Date'] = df['Time'].dt.date
+    df['Weekday'] = df['Time'].dt.weekday
+    df['Is_Weekend'] = df['Weekday'] >= 5
+
     # 按时间槽统计
     time_slot_stats = df.groupby('Time_Slot').agg({
         'Floor': 'count',  # 呼叫次数
+        'Date': 'first',
+        'Weekday': 'first',
+        'Is_Weekend': 'first'
     }).rename(columns={'Floor': 'Call_Count'})
 
     # 统计上行下行比例
@@ -306,18 +446,20 @@ def classify_traffic_mode(time_slot_stats):
 
 def generate_statistics_report(data_frames, output_path):
     """
-    生成详细的统计报告 - 修复版，处理Series对象
+    生成详细的统计报告 - 针对训练集
     """
     print(f"\n[生成统计报告] {output_path}")
 
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write("=" * 60 + "\n")
-        f.write("电梯系统运行统计分析报告\n")
+        f.write("电梯系统运行统计分析报告（前20天训练集）\n")
         f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"分析天数: {TRAINING_DAYS}天 (训练集)\n")
+        f.write(f"保留天数: {VALIDATION_DAYS}天 (验证集)\n")
         f.write("=" * 60 + "\n\n")
 
         # 1. 数据集概览
-        f.write("1. 数据集概览\n")
+        f.write("1. 数据集概览（训练集）\n")
         f.write("-" * 40 + "\n")
 
         # 只处理DataFrame对象
@@ -327,10 +469,11 @@ def generate_statistics_report(data_frames, output_path):
                 f.write(f"  记录数: {len(data):,}\n")
 
                 if 'Time' in data.columns:
-                    f.write(f"  时间范围: {data['Time'].min()} 到 {data['Time'].max()}\n")
-                    # 计算天数
-                    time_range = data['Time'].max() - data['Time'].min()
-                    f.write(f"  天数: {time_range.days + 1}天\n")
+                    start_date = data['Time'].min().date()
+                    end_date = data['Time'].max().date()
+                    days = (end_date - start_date).days + 1
+                    f.write(f"  时间范围: {start_date} 到 {end_date}\n")
+                    f.write(f"  天数: {days}天\n")
 
                 if 'Elevator ID' in data.columns:
                     elevators = data['Elevator ID'].unique()
@@ -469,41 +612,51 @@ def generate_statistics_report(data_frames, output_path):
                 avg_calls = ts_stats[ts_stats['Traffic_Mode'] == mode]['Call_Count'].mean()
                 f.write(f"{mode}: {count}槽 ({percentage:.1f}%), 平均呼叫数: {avg_calls:.2f}\n")
 
-        # 7. 总结与建议
-        f.write("\n7. 总结与建议\n")
-        f.write("-" * 40 + "\n")
+        # 7. 日期分布分析
+        if 'date_analysis' in data_frames:
+            date_analysis = data_frames['date_analysis']
+            if 'daily_stats' in date_analysis:
+                daily_stats = date_analysis['daily_stats']
+                f.write("\n7. 日期分布分析\n")
+                f.write("-" * 40 + "\n")
 
-        # 基于分析结果提供建议
+                f.write(f"工作日天数: {len(daily_stats[~daily_stats['Is_Weekend']])}天\n")
+                f.write(f"周末天数: {len(daily_stats[daily_stats['Is_Weekend']])}天\n")
+
+                if 'weekday_summary' in date_analysis:
+                    weekday_summary = date_analysis['weekday_summary']
+                    f.write("\n按星期统计:\n")
+                    for weekday in range(7):
+                        if weekday in weekday_summary.index:
+                            weekday_name = weekday_summary.loc[weekday, 'Weekday_Name']
+                            mean_calls = weekday_summary.loc[weekday, 'Mean_Calls']
+                            std_calls = weekday_summary.loc[weekday, 'Std_Calls']
+
+                            if pd.notna(mean_calls):
+                                f.write(f"  {weekday_name}: {mean_calls:.0f} ± {std_calls:.0f} 次/天\n")
+
+        # 8. 总结与建议
+        f.write("\n8. 总结与建议（基于前20天训练集）\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"✅ 分析完成，使用前{TRAINING_DAYS}天数据作为训练集\n")
+        f.write(f"✅ 保留后{VALIDATION_DAYS}天数据用于模型验证\n")
+        f.write(f"📊 已识别出不同日期的流量模式差异\n")
+        f.write(f"🔮 可用于建立工作日/节假日分段预测模型\n")
+
         if 'wait_times' in data_frames and isinstance(data_frames['wait_times'], pd.DataFrame) and not data_frames[
             'wait_times'].empty:
             avg_wait = data_frames['wait_times']['Wait_Time'].mean()
             if avg_wait > 60:
-                f.write(f"⚠️  平均等待时间({avg_wait:.1f}秒)偏高，建议优化调度策略\n")
+                f.write(f"⚠️  平均等待时间({avg_wait:.1f}秒)偏高，需要优化调度\n")
             elif avg_wait > 40:
-                f.write(f"📊 平均等待时间({avg_wait:.1f}秒)可接受，但仍有优化空间\n")
+                f.write(f"📊 平均等待时间({avg_wait:.1f}秒)可接受，有优化空间\n")
             else:
                 f.write(f"✅ 平均等待时间({avg_wait:.1f}秒)表现良好\n")
 
-        if 'time_slot_stats' in data_frames and isinstance(data_frames['time_slot_stats'], pd.DataFrame) and not \
-        data_frames['time_slot_stats'].empty:
-            # 识别高峰时段
-            peak_hours = []
-            ts_stats = data_frames['time_slot_stats']
-            for hour in range(6, 22):  # 6点到22点
-                hour_calls = ts_stats[ts_stats['Hour'] == hour]['Call_Count'].sum()
-                if hour_calls > ts_stats['Call_Count'].mean() * 2:  # 超过平均2倍
-                    peak_hours.append(hour)
-
-            if peak_hours:
-                f.write(f"🚀 识别到高峰时段: {', '.join([f'{h}:00' for h in peak_hours])}\n")
-                f.write("   建议在高峰时段增加电梯调度频率或预置电梯\n")
-
-        if 'start_floors' in data_frames and isinstance(data_frames['start_floors'], pd.Series) and not data_frames[
-            'start_floors'].empty:
-            top_floor = data_frames['start_floors'].idxmax()
-            top_count = data_frames['start_floors'].max()
-            f.write(f"📍 最热门的起点楼层: {top_floor}层 ({top_count}次呼叫)\n")
-            f.write(f"   建议将空闲电梯预置在该楼层附近\n")
+        f.write("\n下一步：\n")
+        f.write("1. 基于此训练集建立NHPP预测模型\n")
+        f.write("2. 使用后10天数据验证模型准确性\n")
+        f.write("3. 开发工作日/节假日分段动态停车策略\n")
 
         f.write("\n" + "=" * 60 + "\n")
         f.write("报告结束\n")
@@ -512,14 +665,14 @@ def generate_statistics_report(data_frames, output_path):
 
 
 def create_visualizations(data_frames, results_dir):
-    """创建可视化图表"""
-    print("\n[生成可视化图表]")
+    """创建可视化图表 - 训练集专用"""
+    print("\n[生成可视化图表 - 训练集]")
 
     try:
         # 创建第一个图表：关键指标
         plt.figure(figsize=(15, 10))
 
-        # 子图1: 全天流量曲线
+        # 子图1: 全天流量曲线（训练集）
         plt.subplot(2, 3, 1)
         if 'time_slot_stats' in data_frames and isinstance(data_frames['time_slot_stats'], pd.DataFrame) and not \
         data_frames['time_slot_stats'].empty:
@@ -527,7 +680,7 @@ def create_visualizations(data_frames, results_dir):
             # 按小时聚合
             hourly_stats = ts_stats.groupby('Hour')['Call_Count'].sum()
             plt.plot(hourly_stats.index, hourly_stats.values, marker='o', linewidth=2, color='steelblue')
-            plt.title(f'每小时呼叫量 ({TIME_SLOT_MINUTES}分钟粒度)', fontsize=12)
+            plt.title(f'每小时呼叫量 - 训练集 ({TIME_SLOT_MINUTES}分钟粒度)', fontsize=12)
             plt.xlabel('小时')
             plt.ylabel('呼叫次数')
             plt.xticks(range(0, 24, 2))
@@ -541,7 +694,7 @@ def create_visualizations(data_frames, results_dir):
             wait_df = data_frames['wait_times']
             if not wait_df.empty:
                 plt.hist(wait_df['Wait_Time'], bins=30, color='skyblue', edgecolor='black', alpha=0.7)
-                plt.title('等待时间分布', fontsize=12)
+                plt.title('等待时间分布 - 训练集', fontsize=12)
                 plt.xlabel('等待时间 (秒)')
                 plt.ylabel('频次')
                 max_wait = min(300, wait_df['Wait_Time'].max() * 1.1)
@@ -561,7 +714,7 @@ def create_visualizations(data_frames, results_dir):
             if len(top_10) > 0:
                 colors = plt.cm.viridis(np.linspace(0, 0.8, len(top_10)))
                 plt.bar(range(len(top_10)), top_10.values, color=colors, alpha=0.7)
-                plt.title('起点楼层热度 (Top 10)', fontsize=12)
+                plt.title('起点楼层热度 (Top 10) - 训练集', fontsize=12)
                 plt.xlabel('楼层')
                 plt.ylabel('呼叫次数')
                 plt.xticks(range(len(top_10)), top_10.index, rotation=45)
@@ -576,7 +729,7 @@ def create_visualizations(data_frames, results_dir):
             plt.bar(hourly_up_ratio.index, hourly_up_ratio.values,
                     color='orange', alpha=0.7, width=0.8)
             plt.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
-            plt.title('各小时上行呼叫比例', fontsize=12)
+            plt.title('各小时上行呼叫比例 - 训练集', fontsize=12)
             plt.xlabel('小时')
             plt.ylabel('上行比例')
             plt.xticks(range(0, 24, 2))
@@ -592,33 +745,37 @@ def create_visualizations(data_frames, results_dir):
                 colors = plt.cm.Set3(np.linspace(0, 1, len(mode_dist)))
                 plt.pie(mode_dist.values, labels=mode_dist.index, autopct='%1.1f%%',
                         colors=colors, startangle=90, textprops={'fontsize': 9})
-                plt.title('交通模式分布', fontsize=12)
+                plt.title('交通模式分布 - 训练集', fontsize=12)
 
-        # 子图6: 乘客流量估算
+        # 子图6: 日期分布（工作日 vs 周末）
         plt.subplot(2, 3, 6)
-        if 'passenger_flow' in data_frames and isinstance(data_frames['passenger_flow'], pd.DataFrame) and not \
-        data_frames['passenger_flow'].empty:
-            pass_df = data_frames['passenger_flow']
-            if 'Hour' in pass_df.columns:
-                hourly_pass = pass_df.groupby('Hour').agg({
-                    'Passengers_In': 'sum',
-                    'Passengers_Out': 'sum'
-                })
-                if not hourly_pass.empty:
-                    width = 0.35
-                    x = np.arange(len(hourly_pass))
-                    plt.bar(x - width / 2, hourly_pass['Passengers_In'], width,
-                            label='进入', color='lightblue', alpha=0.7)
-                    plt.bar(x + width / 2, hourly_pass['Passengers_Out'], width,
-                            label='离开', color='lightcoral', alpha=0.7)
-                    plt.title('每小时乘客进出估算', fontsize=12)
-                    plt.xlabel('小时')
-                    plt.ylabel('乘客数')
-                    plt.xticks(x, hourly_pass.index)
-                    plt.legend(fontsize=9)
+        if 'date_analysis' in data_frames and 'daily_stats' in data_frames['date_analysis']:
+            daily_stats = data_frames['date_analysis']['daily_stats']
+            if not daily_stats.empty:
+                # 按日期类型分组
+                weekday_data = daily_stats[~daily_stats['Is_Weekend']]['Daily_Calls'].values
+                weekend_data = daily_stats[daily_stats['Is_Weekend']]['Daily_Calls'].values
+
+                if len(weekday_data) > 0 and len(weekend_data) > 0:
+                    box_data = [weekday_data, weekend_data]
+                    positions = [0, 1]
+                    box = plt.boxplot(box_data, positions=positions, widths=0.6,
+                                      patch_artist=True, showfliers=True)
+
+                    # 设置箱体颜色
+                    colors = ['lightblue', 'lightcoral']
+                    for patch, color in zip(box['boxes'], colors):
+                        patch.set_facecolor(color)
+                        patch.set_alpha(0.7)
+
+                    plt.title('工作日 vs 周末呼叫量对比 - 训练集', fontsize=12)
+                    plt.xlabel('日期类型')
+                    plt.ylabel('每日呼叫次数')
+                    plt.xticks(positions, ['工作日', '周末'])
+                    plt.grid(True, alpha=0.3, axis='y')
 
         plt.tight_layout()
-        save_path = results_dir / 'elevator_analysis_1.png'
+        save_path = results_dir / 'training_analysis_1.png'
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"✅ 分析图表1已保存: {save_path}")
         plt.show()
@@ -642,7 +799,7 @@ def create_visualizations(data_frames, results_dir):
                 if not elev_means.empty:
                     colors = plt.cm.coolwarm(np.linspace(0, 1, len(elev_means)))
                     bars = plt.bar(range(len(elev_means)), elev_means.values, color=colors, alpha=0.7)
-                    plt.title('各电梯平均等待时间', fontsize=12)
+                    plt.title('各电梯平均等待时间 - 训练集', fontsize=12)
                     plt.xlabel('电梯ID')
                     plt.ylabel('平均等待时间 (秒)')
                     plt.xticks(range(len(elev_means)), elev_means.index)
@@ -675,7 +832,7 @@ def create_visualizations(data_frames, results_dir):
                 heatmap_data = heatmap_data[all_minutes]
 
                 sns.heatmap(heatmap_data, cmap='YlOrRd', cbar_kws={'label': '平均呼叫次数'})
-                plt.title(f'{TIME_SLOT_MINUTES}分钟槽呼叫量热力图 (6:00-22:00)', fontsize=12)
+                plt.title(f'{TIME_SLOT_MINUTES}分钟槽呼叫量热力图 (6:00-22:00) - 训练集', fontsize=12)
                 plt.xlabel('分钟')
                 plt.ylabel('小时')
 
@@ -696,24 +853,50 @@ def create_visualizations(data_frames, results_dir):
                 for patch in box['boxes']:
                     patch.set_facecolor('lightblue')
                     patch.set_alpha(0.7)
-                plt.title('各小时等待时间分布', fontsize=12)
+                plt.title('各小时等待时间分布 - 训练集', fontsize=12)
                 plt.xlabel('小时')
                 plt.ylabel('等待时间 (秒)')
                 plt.xticks(range(0, 24, 2))
                 plt.ylim(0, min(300, filtered['Wait_Time'].max() * 1.1))
 
-        # 子图4: 累计呼叫量
+        # 子图4: 每日呼叫量趋势
         plt.subplot(2, 3, 4)
-        if 'hall_calls' in data_frames and isinstance(data_frames['hall_calls'], pd.DataFrame) and not data_frames[
-            'hall_calls'].empty:
-            hall_df = data_frames['hall_calls'].copy()
-            hall_df = hall_df.sort_values('Time')
-            hall_df['Cumulative_Calls'] = range(1, len(hall_df) + 1)
-            plt.plot(hall_df['Time'], hall_df['Cumulative_Calls'], linewidth=2, color='darkgreen')
-            plt.title('累计呼叫量随时间变化', fontsize=12)
-            plt.xlabel('时间')
-            plt.ylabel('累计呼叫次数')
-            plt.grid(True, alpha=0.3)
+        if 'date_analysis' in data_frames and 'daily_stats' in data_frames['date_analysis']:
+            daily_stats = data_frames['date_analysis']['daily_stats']
+            if not daily_stats.empty:
+                # 按日期排序
+                daily_stats = daily_stats.sort_index()
+
+                # 修复：将日期索引转换为字符串格式
+                # daily_stats.index 是 datetime.date 对象，我们需要将其转换为字符串
+                dates = [d.strftime('%m-%d') for d in daily_stats.index]
+
+                # 创建条形图，用颜色区分工作日和周末
+                colors = ['lightblue' if not is_weekend else 'lightcoral'
+                          for is_weekend in daily_stats['Is_Weekend']]
+
+                plt.bar(range(len(daily_stats)), daily_stats['Daily_Calls'],
+                        color=colors, alpha=0.7, edgecolor='black')
+                plt.title('每日呼叫量趋势 - 训练集', fontsize=12)
+                plt.xlabel('日期')
+                plt.ylabel('呼叫次数')
+
+                # 设置x轴标签（每隔几天显示一次）
+                if len(dates) > 10:
+                    step = len(dates) // 10 + 1
+                    plt.xticks(range(0, len(dates), step),
+                               [dates[i] for i in range(0, len(dates), step)], rotation=45)
+                else:
+                    plt.xticks(range(len(dates)), dates, rotation=45)
+
+                # 添加图例
+                from matplotlib.patches import Patch
+                legend_elements = [
+                    Patch(facecolor='lightblue', alpha=0.7, label='工作日'),
+                    Patch(facecolor='lightcoral', alpha=0.7, label='周末')
+                ]
+                plt.legend(handles=legend_elements, fontsize=9)
+                plt.grid(True, alpha=0.3, axis='y')
 
         # 子图5: 各模式呼叫强度
         plt.subplot(2, 3, 5)
@@ -725,7 +908,7 @@ def create_visualizations(data_frames, results_dir):
             if not mode_avg.empty:
                 colors = plt.cm.Paired(np.linspace(0, 1, len(mode_avg)))
                 bars = plt.bar(range(len(mode_avg)), mode_avg.values, color=colors, alpha=0.7)
-                plt.title('各交通模式平均呼叫强度', fontsize=12)
+                plt.title('各交通模式平均呼叫强度 - 训练集', fontsize=12)
                 plt.xlabel('交通模式')
                 plt.ylabel('平均呼叫次数/槽')
                 plt.xticks(range(len(mode_avg)), mode_avg.index, rotation=45, ha='right')
@@ -733,44 +916,34 @@ def create_visualizations(data_frames, results_dir):
                 for i, v in enumerate(mode_avg.values):
                     plt.text(i, v + 0.1, f'{v:.1f}', ha='center', va='bottom', fontsize=9)
 
-        # 子图6: 等待时间与呼叫量关系
+        # 子图6: 各星期呼叫量对比
         plt.subplot(2, 3, 6)
-        if 'wait_times' in data_frames and isinstance(data_frames['wait_times'], pd.DataFrame) and not data_frames[
-            'wait_times'].empty and \
-                'time_slot_stats' in data_frames and isinstance(data_frames['time_slot_stats'], pd.DataFrame) and not \
-        data_frames['time_slot_stats'].empty:
-            wait_df = data_frames['wait_times']
-            ts_stats = data_frames['time_slot_stats']
+        if 'date_analysis' in data_frames and 'weekday_summary' in data_frames['date_analysis']:
+            weekday_summary = data_frames['date_analysis']['weekday_summary']
+            if not weekday_summary.empty:
+                weekday_names = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
+                mean_calls = []
+                std_calls = []
 
-            # 按时间槽对齐数据
-            wait_df['Time_Slot'] = wait_df['Time_call'].dt.floor(f'{TIME_SLOT_MINUTES}min')
-            wait_by_slot = wait_df.groupby('Time_Slot')['Wait_Time'].mean()
-            calls_by_slot = ts_stats['Call_Count']
+                for i in range(7):
+                    if i in weekday_summary.index:
+                        mean_calls.append(weekday_summary.loc[i, 'Mean_Calls'])
+                        std_calls.append(weekday_summary.loc[i, 'Std_Calls'])
+                    else:
+                        mean_calls.append(0)
+                        std_calls.append(0)
 
-            # 找到共同的时间槽
-            common_slots = wait_by_slot.index.intersection(calls_by_slot.index)
-            if len(common_slots) > 0:
-                wait_values = wait_by_slot.loc[common_slots].values
-                call_values = calls_by_slot.loc[common_slots].values
-
-                plt.scatter(call_values, wait_values, alpha=0.6, color='purple', s=30)
-
-                # 添加趋势线
-                if len(common_slots) > 1:
-                    z = np.polyfit(call_values, wait_values, 1)
-                    p = np.poly1d(z)
-                    x_range = np.linspace(min(call_values), max(call_values), 100)
-                    plt.plot(x_range, p(x_range), 'r--', alpha=0.8,
-                             label=f'趋势线: y={z[0]:.2f}x+{z[1]:.2f}')
-                    plt.legend(fontsize=9)
-
-                plt.title('等待时间与呼叫量关系', fontsize=12)
-                plt.xlabel('时间槽呼叫次数')
-                plt.ylabel('平均等待时间 (秒)')
-                plt.grid(True, alpha=0.3)
+                x = range(len(weekday_names))
+                plt.bar(x, mean_calls, yerr=std_calls, capsize=5,
+                        color='lightgreen', alpha=0.7, edgecolor='black')
+                plt.title('各星期每日平均呼叫量 - 训练集', fontsize=12)
+                plt.xlabel('星期')
+                plt.ylabel('平均呼叫次数')
+                plt.xticks(x, weekday_names)
+                plt.grid(True, alpha=0.3, axis='y')
 
         plt.tight_layout()
-        save_path = results_dir / 'elevator_analysis_2.png'
+        save_path = results_dir / 'training_analysis_2.png'
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"✅ 分析图表2已保存: {save_path}")
         plt.show()
@@ -782,9 +955,9 @@ def create_visualizations(data_frames, results_dir):
 
 
 def main():
-    """主函数"""
+    """主函数 - 训练集分析版本"""
     print("=" * 60)
-    print("电梯数据分析系统")
+    print(f"电梯数据分析系统（前{TRAINING_DAYS}天训练集）")
     print("=" * 60)
 
     # 1. 获取数据路径
@@ -797,7 +970,7 @@ def main():
 
     # 2. 读取所有数据文件
     print("\n" + "=" * 60)
-    print("加载数据文件")
+    print(f"加载数据文件（前{TRAINING_DAYS}天训练集）")
     print("=" * 60)
 
     # 定义要加载的文件
@@ -827,7 +1000,7 @@ def main():
 
     # 3. 数据分析和处理
     print("\n" + "=" * 60)
-    print("数据分析处理")
+    print(f"数据分析处理（前{TRAINING_DAYS}天训练集）")
     print("=" * 60)
 
     # 3.1 估算乘客流量
@@ -839,7 +1012,7 @@ def main():
         else:
             print("⚠️  无法估算乘客流量")
 
-    # 3.2 计算等待时间（使用简化方法）
+    # 3.2 计算等待时间
     if 'hall_calls' in data_frames and 'car_stops' in data_frames:
         wait_times = calculate_wait_times_simple(data_frames['hall_calls'], data_frames['car_stops'])
         if not wait_times.empty:
@@ -866,24 +1039,55 @@ def main():
     data_frames['start_floors'] = start_floors
     data_frames['end_floors'] = end_floors
 
+    # 3.6 分析日期分布
+    date_analysis = analyze_date_distribution(data_frames)
+    if date_analysis:
+        data_frames['date_analysis'] = date_analysis
+
     # 4. 生成统计报告
-    results_dir = Path('results')
+    results_dir = Path('training_results')
     results_dir.mkdir(exist_ok=True)
 
-    report_path = results_dir / 'elevator_statistics_report.txt'
+    report_path = results_dir / f'elevator_training_statistics_{TRAINING_DAYS}days.txt'
     generate_statistics_report(data_frames, report_path)
 
     # 5. 可视化分析
     print("\n" + "=" * 60)
-    print("生成可视化图表")
+    print(f"生成可视化图表（前{TRAINING_DAYS}天训练集）")
     print("=" * 60)
 
     create_visualizations(data_frames, results_dir)
+
+    # 6. 保存处理后的数据（可选，用于后续建模）
+    print("\n" + "=" * 60)
+    print("保存处理后的训练数据")
+    print("=" * 60)
+
+    # 保存时间槽统计数据（用于NHPP建模）
+    if 'time_slot_stats' in data_frames and isinstance(data_frames['time_slot_stats'], pd.DataFrame):
+        time_slot_data_path = results_dir / 'time_slot_stats_training.csv'
+        data_frames['time_slot_stats'].to_csv(time_slot_data_path, index=True)
+        print(f"✅ 时间槽统计数据已保存: {time_slot_data_path}")
+
+    # 保存等待时间数据
+    if 'wait_times' in data_frames and isinstance(data_frames['wait_times'], pd.DataFrame):
+        wait_times_data_path = results_dir / 'wait_times_training.csv'
+        data_frames['wait_times'].to_csv(wait_times_data_path, index=False)
+        print(f"✅ 等待时间数据已保存: {wait_times_data_path}")
+
+    # 保存楼层需求数据
+    if 'start_floors' in data_frames and isinstance(data_frames['start_floors'], pd.Series):
+        floor_demand_path = results_dir / 'floor_demand_training.csv'
+        data_frames['start_floors'].to_csv(floor_demand_path, header=True)
+        print(f"✅ 楼层需求数据已保存: {floor_demand_path}")
 
     print("\n" + "=" * 60)
     print("分析完成！")
     print(f"📊 统计报告: {report_path}")
     print(f"📈 图表文件: {results_dir}/")
+    print(f"📁 处理后数据: {results_dir}/*.csv")
+    print(f"✅ 使用前{TRAINING_DAYS}天数据作为训练集")
+    print(f"🔮 保留后{VALIDATION_DAYS}天数据用于模型验证")
     print("=" * 60)
 
 
